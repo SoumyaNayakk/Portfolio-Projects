@@ -1,0 +1,159 @@
+from dotenv import load_dotenv
+import streamlit as st
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+from langchain.vectorstores import Qdrant
+from langchain.embeddings.openai import OpenAIEmbeddings
+import qdrant_client
+import os
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    context_recall,
+    context_precision,
+    context_entity_recall,
+)
+
+import numpy as np
+
+def get_vector_store():
+    client = qdrant_client.QdrantClient(
+        os.getenv("QDRANT_HOST"),
+        api_key=os.getenv("QDRANT_API_KEY")
+    )
+    
+    embeddings = OpenAIEmbeddings()
+
+    vector_store = Qdrant(
+        client=client, 
+        collection_name=os.getenv("QDRANT_COLLECTION_NAME"), 
+        embeddings=embeddings,
+    )
+    
+    return vector_store
+
+def retrieve_documents(retriever, user_question, num_documents=10):
+    # Retrieve the top N documents
+    relevant_docs = retriever.get_relevant_documents(user_question)[:num_documents]
+    return relevant_docs
+
+def add_noise(text, noise_level=0.1):
+    words = text.split()
+    num_noisy_words = int(len(words) * noise_level)
+    noisy_indices = np.random.choice(len(words), num_noisy_words, replace=False)
+    for i in noisy_indices:
+        words[i] = ''.join(np.random.choice(list('abcdefghijklmnopqrstuvwxyz'), size=len(words[i])))
+    return ' '.join(words)
+
+def evaluate_noise_robustness(original_text, model, noise_level=0.1):
+    noisy_text = add_noise(original_text, noise_level)
+    original_answer = model(original_text)
+    noisy_answer = model(noisy_text)
+    return original_answer == noisy_answer
+
+def evaluate_information_integration(contexts, model):
+    combined_context = " ".join(contexts)
+    answer = model(combined_context)
+    return answer
+
+def generate_counterfactuals(question):
+    counterfactuals = [question.replace("how", "what"), question.replace("why", "when")]
+    return counterfactuals
+
+def evaluate_counterfactual_robustness(question, model):
+    counterfactuals = generate_counterfactuals(question)
+    answers = [model(cf_question) for cf_question in counterfactuals]
+    return answers
+
+def evaluate_negative_rejection(question, model, threshold=0.5):
+    answer = model(question)
+    is_rejected = len(answer.split()) < threshold
+    return is_rejected
+
+def main():
+    load_dotenv()
+    
+    st.set_page_config(page_title="Ask Qdrant")
+    st.header("Ask your remote database 💬")
+    
+    vector_store = get_vector_store()
+    retriever = vector_store.as_retriever()
+
+    user_question = st.text_input("Ask a question about your PDF:")
+    if user_question:
+        import time
+        start_time = time.time()
+        
+        # Retrieve documents
+        relevant_docs = retrieve_documents(retriever, user_question, num_documents=10)
+        
+        # Generate answer using the LLM with expanded context
+        context = " ".join([doc.page_content for doc in relevant_docs])
+        prompt = f"Based on the following context, answer the question: {context}\nQuestion: {user_question}"
+        llm = OpenAI()
+        answer = llm(prompt)
+        
+        end_time = time.time()
+        latency_time = end_time - start_time
+        
+        questions = [user_question]
+        ground_truths = [""]  # Replace with actual ground truths if available
+
+        answers = [answer]
+        contexts = [[doc.page_content for doc in relevant_docs]]
+
+        # Evaluate using custom metrics
+        noise_robustness = evaluate_noise_robustness(user_question, llm)
+        information_integration = evaluate_information_integration(contexts[0], llm)
+        counterfactual_answers = evaluate_counterfactual_robustness(user_question, llm)
+        negative_rejection = evaluate_negative_rejection(user_question, llm)
+        
+        data = {
+            "question": questions,
+            "answer": answers,
+            "contexts": contexts,
+            "ground_truth": ground_truths,
+            "noise_robustness": [noise_robustness],
+            "information_integration": [information_integration],
+            "counterfactual_answers": [counterfactual_answers],
+            "negative_rejection": [negative_rejection]
+        }
+
+        dataset = Dataset.from_dict(data)
+
+        result = evaluate(
+            dataset=dataset, 
+            metrics=[
+                context_precision,
+                context_recall,
+                context_entity_recall,
+                faithfulness,
+                answer_relevancy,
+            ],
+        )
+
+        result['latency'] = [latency_time] * len(result)
+
+        df = result.to_pandas()
+        st.markdown("### Evaluation Metrics:")
+        for index, row in df.iterrows():
+            st.markdown(f"**Question**: {row['question']}")
+            st.markdown(f"**Answer**: {row['answer']}")
+            st.markdown(f"**Contexts**: {', '.join(row['contexts'])}")
+            st.markdown(f"**Ground Truth**: {row['ground_truth']}")
+            st.markdown(f"**Context Precision**: {row['context_precision']}")
+            st.markdown(f"**Context Recall**: {row['context_recall']}")
+            st.markdown(f"**Context Entity Recall**: {row['context_entity_recall']}")
+            st.markdown(f"**Faithfulness**: {row['faithfulness']}")
+            st.markdown(f"**Answer Relevancy**: {row['answer_relevancy']}")
+            st.markdown(f"**Noise Robustness**: {row['noise_robustness']}")
+            st.markdown(f"**Information Integration**: {row['information_integration']}")
+            st.markdown(f"**Counterfactual Answers**: {', '.join(row['counterfactual_answers'])}")
+            st.markdown(f"**Negative Rejection**: {row['negative_rejection']}")
+            st.markdown(f"**Latency**: {latency_time}")
+            st.markdown("---")
+
+if __name__ == '__main__':
+    main()

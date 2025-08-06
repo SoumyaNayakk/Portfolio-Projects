@@ -1,0 +1,143 @@
+from dotenv import load_dotenv
+import streamlit as st
+from langchain.chains import RetrievalQA
+from langchain.llms import OpenAI
+from langchain.vectorstores import Qdrant
+from langchain.embeddings.openai import OpenAIEmbeddings
+import qdrant_client
+import os
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    context_recall,
+    context_utilization,
+    context_precision,
+    #context_relevance,
+    context_entity_recall,
+    #noise_robustness,
+    #information_integration,
+    #counterfactual_robustness,
+    #negative_rejection,
+    #latency,
+)
+
+def get_vector_store():
+    client = qdrant_client.QdrantClient(
+        os.getenv("QDRANT_HOST"),
+        api_key=os.getenv("QDRANT_API_KEY")
+    )
+    
+    embeddings = OpenAIEmbeddings()
+
+    vector_store = Qdrant(
+        client=client, 
+        collection_name=os.getenv("QDRANT_COLLECTION_NAME"), 
+        embeddings=embeddings,
+    )
+    
+    return vector_store
+
+def main():
+    load_dotenv()
+    
+    st.set_page_config(page_title="Ask Qdrant")
+    st.header("Ask your remote database 💬")
+    
+    # OpenAI API key input
+    # api_key = st.text_input("Enter your OpenAI API Key", type="password")
+    # if api_key:
+    #     os.environ["OPENAI_API_KEY"] = api_key
+    
+    # create vector store
+    vector_store = get_vector_store()
+    
+    # create chain 
+    qa = RetrievalQA.from_chain_type(
+        llm=OpenAI(),
+        chain_type="stuff",
+        retriever=vector_store.as_retriever()
+    )
+
+    # show user input
+    user_question = st.text_input("Ask a question about your PDF:")
+    if user_question:
+        #st.write(f"Question: {user_question}")
+        
+        # Measure latency start
+        import time
+        start_time = time.time()
+        
+        answer = qa.run(user_question)
+        
+        # Measure latency end
+        end_time = time.time()
+        latency_time = end_time - start_time
+        
+        #st.write(f"Answer: {answer}")
+
+        # Example questions and ground truths for evaluation
+        questions = [user_question]
+        ground_truths = [""]  # Replace with actual ground truths if available
+
+        # Inference
+        answers = [answer]
+        contexts = [[doc.page_content for doc in vector_store.as_retriever().get_relevant_documents(user_question)]]
+
+        # Prepare data for evaluation
+        data = {
+            "question": questions,
+            "answer": answers,
+            "contexts": contexts,
+            "ground_truth": ground_truths  # Ensure this field matches the required column name
+        }
+
+        # Convert to dataset
+        dataset = Dataset.from_dict(data)
+
+        # Evaluate
+        result = evaluate(
+            dataset=dataset, 
+            metrics=[
+                context_precision,
+                context_recall,
+                #context_relevance,
+                context_entity_recall,
+                #noise_robustness,
+                faithfulness,
+                answer_relevancy,
+                #information_integration,
+                #counterfactual_robustness,
+                #negative_rejection,
+                #latency,
+            ],
+        )
+
+        # Add latency to result
+        result['latency'] = [latency_time] * len(result)
+
+        # Display results
+        df = result.to_pandas()
+        print(f"Columns: {df.columns}")
+        st.markdown("### Evaluation Metrics:")
+        for index, row in df.iterrows():
+            st.markdown(f"**Question**: {row['question']}")
+            st.markdown(f"**Answer**: {row['answer']}")
+            st.markdown(f"**Contexts**: {', '.join(row['contexts'])}")
+            st.markdown(f"**Ground Truth**: {1.0}")
+            st.markdown(f"**Context Precision**: {row['context_precision']}")
+            st.markdown(f"**Context Recall**: {row['context_recall']}")
+            #st.markdown(f"**Context Relevance**: {row['context_relevance']}")
+            st.markdown(f"**Context Entity Recall**: {row['context_entity_recall']}")
+            #st.markdown(f"**Noise Robustness**: {row['noise_robustness']}")
+            st.markdown(f"**Faithfulness**: {row['faithfulness']}")
+            st.markdown(f"**Answer Relevancy**: {row['answer_relevancy']}")
+            #st.markdown(f"**Information Integration**: {row['information_integration']}")
+            #st.markdown(f"**Counterfactual Robustness**: {row['counterfactual_robustness']}")
+            #st.markdown(f"**Negative Rejection**: {row['negative_rejection']}")
+            st.markdown(f"**Latency**: {latency_time}")
+            st.markdown("---")  # Add a horizontal line for separation
+
+if __name__ == '__main__':
+    main()
